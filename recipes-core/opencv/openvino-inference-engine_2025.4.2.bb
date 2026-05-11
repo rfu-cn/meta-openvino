@@ -51,7 +51,6 @@ EXTRA_OECMAKE += " \
                   -DCMAKE_CXX_STANDARD=17 \
                   -DProtobuf_PROTOC_EXECUTABLE=${STAGING_BINDIR_NATIVE}/protoc \
                   -DENABLE_SYSTEM_PUGIXML=TRUE \
-                  -DENABLE_OV_ONNX_FRONTEND=FALSE \
                   -DUSE_BUILD_TYPE_SUBFOLDER=OFF \
                   -DENABLE_FUZZING=OFF \
                   -DCPACK_GENERATOR=RPM \
@@ -60,23 +59,26 @@ EXTRA_OECMAKE += " \
                   -DFETCHCONTENT_BASE_DIR="${S}" \
                   -DENABLE_INTEL_NPU=OFF \
                   -DPYTHON3_CONFIG="python3-config" \
-                  -DENABLE_OV_JAX_FRONTEND=OFF \
                   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
                   -DENABLE_SYSTEM_ZLIB=ON \
                   "
 EXTRA_OECMAKE:append:aarch64 = " -DARM_COMPUTE_LIB_DIR=${STAGING_LIBDIR} "
 
+# absl_vlog_config_internal is a private abseil lib referenced by static archives
+# linked into openvino frontends (onnx, tf, paddle). LDFLAGS places it before those
+# archives so --as-needed drops it. Only inject when frontend that uses protobuf is enabled.
+EXTRA_OECMAKE:append = "${@bb.utils.contains_any('PACKAGECONFIG', 'onnx tf paddle', \
+    ' -Dabsl_DIR=${STAGING_LIBDIR}/cmake/absl', '', d)}"
+TARGET_LDFLAGS:append = "${@bb.utils.contains_any('PACKAGECONFIG', 'onnx tf paddle', \
+    ' -Wl,--no-as-needed -labsl_vlog_config_internal -Wl,--as-needed', '', d)}"
+
 DEPENDS += "\
-            flatbuffers-native \
             nlohmann-json \
             gflags \
-            protobuf \
-            protobuf-native \
             pugixml \
             python3-pybind11 \
             python3-scons-native \
             qemu-native \
-            snappy \
             zlib \
             "
 DEPENDS:append:aarch64 = " arm-compute-library"
@@ -85,7 +87,7 @@ DEPENDS:append:aarch64 = " arm-compute-library"
 #COMPATIBLE_HOST = '(x86_64).*-linux'
 COMPATIBLE_HOST:libc-musl = "null"
 
-PACKAGECONFIG ?= "tbb samples"
+PACKAGECONFIG ?= "tbb tf tflite paddle pytorch samples"
 # Threading models (mutually exclusive — enable only one of tbb, omp, iomp, seq)
 PACKAGECONFIG[tbb] = "-DTHREADING=TBB -DENABLE_SYSTEM_TBB=ON -DTBB_DIR='${STAGING_LIBDIR}/cmake/TBB' -DENABLE_TBBBIND_2_5=OFF, , tbb, , , omp iomp seq"
 PACKAGECONFIG[omp] = "-DTHREADING=OMP -DENABLE_INTEL_OPENMP=OFF, , , , , tbb iomp seq"
@@ -110,6 +112,14 @@ LIC_FILES_CHKSUM += "${@bb.utils.contains('PACKAGECONFIG', 'tests', \
     '', d)}"
 LDFLAGS:append = "${@bb.utils.contains('PACKAGECONFIG', 'tests', ' -Wl,--allow-shlib-undefined', '', d)}"
 
+# Frontends
+PACKAGECONFIG[onnx] = "-DENABLE_OV_ONNX_FRONTEND=ON, -DENABLE_OV_ONNX_FRONTEND=OFF, protobuf protobuf-native abseil-cpp,"
+PACKAGECONFIG[tf] = "-DENABLE_OV_TF_FRONTEND=ON, -DENABLE_OV_TF_FRONTEND=OFF, protobuf protobuf-native snappy abseil-cpp,"
+PACKAGECONFIG[tflite] = "-DENABLE_OV_TF_LITE_FRONTEND=ON, -DENABLE_OV_TF_LITE_FRONTEND=OFF, flatbuffers-native,"
+PACKAGECONFIG[paddle] = "-DENABLE_OV_PADDLE_FRONTEND=ON, -DENABLE_OV_PADDLE_FRONTEND=OFF, protobuf protobuf-native abseil-cpp,"
+PACKAGECONFIG[pytorch] = "-DENABLE_OV_PYTORCH_FRONTEND=ON, -DENABLE_OV_PYTORCH_FRONTEND=OFF,,"
+PACKAGECONFIG[jax] = "-DENABLE_OV_JAX_FRONTEND=ON, -DENABLE_OV_JAX_FRONTEND=OFF,,"
+
 SRC_URI += "${@bb.utils.contains('PACKAGECONFIG', 'python3', \
     'git://github.com/openvinotoolkit/telemetry.git;protocol=https;destsuffix=${BB_GIT_DEFAULT_DESTSUFFIX}/thirdparty/telemetry;name=telemetry;nobranch=1;lfs=0', \
     '', d)}"
@@ -127,6 +137,15 @@ SRCREV_node-addon-api = "6babc960154752f686a7dca8e712991a976a754b"
 SRCREV_FORMAT .= "${@bb.utils.contains('PACKAGECONFIG', 'node', '_node-addon-api', '', d)}"
 LIC_FILES_CHKSUM += "${@bb.utils.contains('PACKAGECONFIG', 'node', \
     'file://node-addon-api-src/LICENSE.md;md5=fc3ff1120869be6b3cce17f9a06bfe2e', \
+    '', d)}"
+
+SRC_URI += "${@bb.utils.contains('PACKAGECONFIG', 'onnx', \
+    'git://github.com/onnx/onnx.git;protocol=https;destsuffix=${BB_GIT_DEFAULT_DESTSUFFIX}/thirdparty/onnx/onnx;name=onnx;branch=rel-1.17.0;lfs=0', \
+    '', d)}"
+SRCREV_onnx = "b8baa8446686496da4cc8fda09f2b6fe65c2a02c"
+SRCREV_FORMAT .= "${@bb.utils.contains('PACKAGECONFIG', 'onnx', '_onnx', '', d)}"
+LIC_FILES_CHKSUM += "${@bb.utils.contains('PACKAGECONFIG', 'onnx', \
+    'file://thirdparty/onnx/onnx/LICENSE;md5=3b83ef96387f14655fc854ddc3c6bd57', \
     '', d)}"
 
 do_configure:prepend() {
@@ -154,10 +173,20 @@ do_install:append() {
 
     find ${B}/src/plugins/intel_cpu/cross-compiled/ -type f -name *_disp.cpp -exec sed -i -e 's%'"${S}"'%'"${TARGET_DBGSRC_DIR}"'%g' {} +
 
+    # Remove sample helper files when samples are not packaged
+    if [ -d ${D}${datadir}/openvino ] && [ -z "${@bb.utils.contains('PACKAGECONFIG', 'samples', '1', '', d)}" ]; then
+        rm -rf ${D}${datadir}/openvino
+    fi
+
     # Install the Node.js addon (excluded from cmake install by CPACK RPM packaging)
     if [ -f ${S}/bin/intel64/ov_node_addon.node ]; then
         install -d ${D}${libdir}
         install -m 0755 ${S}/bin/intel64/ov_node_addon.node ${D}${libdir}/ov_node_addon.node
+    fi
+
+    # Install JAX frontend (DISABLE_CPP_INSTALL / EXCLUDE_FROM_ALL in upstream CMake)
+    if [ -f ${S}/bin/intel64/libopenvino_jax_frontend.so.${PV} ]; then
+        cmake --install ${B} --component jax --prefix ${D}${prefix}
     fi
 }
 
@@ -172,7 +201,7 @@ FILES:${PN} += "\
                 "
 
 # Move inference engine samples into a separate package
-PACKAGES =+ "${PN}-samples"
+PACKAGES =+ "${@bb.utils.contains('PACKAGECONFIG', 'samples', '${PN}-samples', '', d)}"
 
 FILES:${PN}-samples = "${datadir}/openvino \
                        ${bindir} \
@@ -183,12 +212,12 @@ FILES:${PN}-samples = "${datadir}/openvino \
 RDEPENDS:${PN}-samples += "python3-core"
 
 # Package for inference engine python API
-PACKAGES =+ "${PN}-python3"
+PACKAGES =+ "${@bb.utils.contains('PACKAGECONFIG', 'python3', '${PN}-python3', '', d)}"
 
 FILES:${PN}-python3 = "${PYTHON_SITEPACKAGES_DIR}"
 
 # Package for Node.js bindings
-PACKAGES =+ "${PN}-node"
+PACKAGES =+ "${@bb.utils.contains('PACKAGECONFIG', 'node', '${PN}-node', '', d)}"
 
 FILES:${PN}-node = "${libdir}/ov_node_addon.node"
 
